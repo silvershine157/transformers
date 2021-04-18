@@ -59,6 +59,28 @@ MBART_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
+def pplm_make_perturb(Gkv, device):
+    num_layers = len(Gkv)
+    bsz, d1, l, d2 = Gkv[0][0].shape
+    perturb = nn.Parameter(torch.zeros([num_layers, 2, bsz, d1, l, d2], device=device))
+    return perturb
+
+
+def pplm_add_perturb(init_Gkv, perturb):
+    num_layers = len(init_Gkv)
+    perturbed_list = []
+    for layer_idx in range(num_layers):
+        layer_list = []
+        for type_idx in [0, 1]: # decoder k-v only
+            temp = init_Gkv[layer_idx][type_idx] + perturb[layer_idx, type_idx]
+            layer_list.append(temp)
+        for type_idx in [2, 3]:
+            layer_list.append(init_Gkv[layer_idx][type_idx])           
+        perturbed_list.append(tuple(layer_list))
+    Gkv = tuple(perturbed_list)
+    return Gkv
+
+
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int):
     """
     Shift input ids one token to the right, and wrap the last non pad token (the <LID> token) Note that MBart does not
@@ -1296,28 +1318,46 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
         if self.discriminator is not None:
 
             # 1. tell the discriminator what token has been chosen last time
-            past_disc_state = None
-            _, current_disc_state = self.discriminator(ids=decoder_input_ids, state=past_disc_state)
+            if past_key_values is None:
+                disc_past = None
+                gen_past = None
+            else:
+                gen_past, disc_past = past_key_values
+
+            with torch.no_grad():
+                _, current_disc_state = self.discriminator(ids=decoder_input_ids, state=disc_past)
 
             # 2. update generator past
-            outputs = self.model(
-                input_ids,
-                attention_mask=attention_mask,
-                decoder_input_ids=decoder_input_ids,
-                encoder_outputs=encoder_outputs,
-                decoder_attention_mask=decoder_attention_mask,
-                head_mask=head_mask,
-                decoder_head_mask=decoder_head_mask,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds,
-                decoder_inputs_embeds=decoder_inputs_embeds,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-            lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias # [beam(5), 1, vocsize(250027)]
-            disc_score, _ = self.discriminator(logits=lm_logits, state=current_disc_state)
+            if past_key_values is not None:
+                perturb = pplm_make_perturb(gen_past, self.device)
+                perturb_opt = torch.optim.SGD([perturb], lr=0.1)
+                for _ in range(3):
+                    perturbed_gen_past = pplm_add_perturb(gen_past, perturb)
+                    outputs = self.model(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        decoder_input_ids=decoder_input_ids,
+                        encoder_outputs=encoder_outputs,
+                        decoder_attention_mask=decoder_attention_mask,
+                        head_mask=head_mask,
+                        decoder_head_mask=decoder_head_mask,
+                        past_key_values=perturbed_gen_past,
+                        inputs_embeds=inputs_embeds,
+                        decoder_inputs_embeds=decoder_inputs_embeds,
+                        use_cache=use_cache,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        return_dict=return_dict,
+                    )
+                    lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias # [beam(5), 1, vocsize(250027)]
+                    disc_score, _ = self.discriminator(logits=lm_logits, state=current_disc_state)
+                    loss = -disc_score.sum() # independent gradients
+                    perturb_opt.zero_grad()
+                    loss.backward()
+                    perturb_opt.step()
+                gen_past = pplm_add_perturb(gen_past, perturb.detach())
+        else:
+            gen_past = past_key_values
 
         # 3. obtain final logits for current generator step
         with torch.no_grad():
@@ -1329,7 +1369,7 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
                 decoder_attention_mask=decoder_attention_mask,
                 head_mask=head_mask,
                 decoder_head_mask=decoder_head_mask,
-                past_key_values=past_key_values,
+                past_key_values=gen_past,
                 inputs_embeds=inputs_embeds,
                 decoder_inputs_embeds=decoder_inputs_embeds,
                 use_cache=use_cache,
@@ -1338,6 +1378,11 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
                 return_dict=return_dict,
             )
             lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias # [beam(5), 1, vocsize(250027)]
+
+        if self.discriminator is not None:
+            past = (outputs.past_key_values, current_disc_state)
+        else:
+            past = outputs.past_key_values
 
         masked_lm_loss = None
         if labels is not None:
@@ -1351,7 +1396,7 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
         return Seq2SeqLMOutput(
             loss=masked_lm_loss,
             logits=lm_logits,
-            past_key_values=outputs.past_key_values,
+            past_key_values=past,
             decoder_hidden_states=outputs.decoder_hidden_states,
             decoder_attentions=outputs.decoder_attentions,
             cross_attentions=outputs.cross_attentions,
@@ -1379,14 +1424,25 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
         return shift_tokens_right(labels, self.config.pad_token_id)
 
-    @staticmethod
-    def _reorder_cache(past, beam_idx):
-        reordered_past = ()
-        for layer_past in past:
-            # cached cross_attention states don't have to be reordered -> they are always the same
-            reordered_past += (
-                tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
-            )
+    #@staticmethod
+    def _reorder_cache(self, past, beam_idx):
+        if self.discriminator is not None:
+            reordered_gen_past = ()
+            gen_past, disc_past = past
+            for layer_past in gen_past:
+                # cached cross_attention states don't have to be reordered -> they are always the same
+                reordered_gen_past += (
+                    tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
+                )
+            reordered_disc_past = disc_past.index_select(0, beam_idx)
+            reordered_past = (reordered_gen_past, reordered_disc_past)
+        else:
+            reordered_past = ()
+            for layer_past in past:
+                # cached cross_attention states don't have to be reordered -> they are always the same
+                reordered_past += (
+                    tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
+                )
         return reordered_past
 
 
