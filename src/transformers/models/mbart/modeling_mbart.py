@@ -1204,6 +1204,7 @@ class MBartModel(MBartPreTrainedModel):
         )
 
 
+
 @add_start_docstrings(
     "The MBART Model with a language modeling head. Can be used for summarization.", MBART_START_DOCSTRING
 )
@@ -1223,6 +1224,11 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
         self.lm_head = nn.Linear(config.d_model, self.model.shared.num_embeddings, bias=False)
 
         self.init_weights()
+
+        self.discriminator = None
+
+    def register_discriminator(self, discriminator):
+        self.discriminator = discriminator
 
     def get_encoder(self):
         return self.model.get_encoder()
@@ -1286,23 +1292,52 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
             if decoder_input_ids is None:
                 decoder_input_ids = shift_tokens_right(labels, self.config.pad_token_id)
 
-        outputs = self.model(
-            input_ids,
-            attention_mask=attention_mask,
-            decoder_input_ids=decoder_input_ids,
-            encoder_outputs=encoder_outputs,
-            decoder_attention_mask=decoder_attention_mask,
-            head_mask=head_mask,
-            decoder_head_mask=decoder_head_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            decoder_inputs_embeds=decoder_inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
+
+        if self.discriminator is not None:
+
+            # 1. tell the discriminator what token has been chosen last time
+            past_disc_state = None
+            _, current_disc_state = self.discriminator(ids=decoder_input_ids, state=past_disc_state)
+
+            # 2. update generator past
+            outputs = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                decoder_input_ids=decoder_input_ids,
+                encoder_outputs=encoder_outputs,
+                decoder_attention_mask=decoder_attention_mask,
+                head_mask=head_mask,
+                decoder_head_mask=decoder_head_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+            lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias # [beam(5), 1, vocsize(250027)]
+            disc_score, _ = self.discriminator(logits=lm_logits, state=current_disc_state)
+
+        # 3. obtain final logits for current generator step
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                decoder_input_ids=decoder_input_ids,
+                encoder_outputs=encoder_outputs,
+                decoder_attention_mask=decoder_attention_mask,
+                head_mask=head_mask,
+                decoder_head_mask=decoder_head_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+            lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias # [beam(5), 1, vocsize(250027)]
 
         masked_lm_loss = None
         if labels is not None:

@@ -661,7 +661,6 @@ class GenerationMixin:
             stopping_criteria.append(MaxTimeCriteria(max_time=max_time))
         return stopping_criteria
 
-    @torch.no_grad()
     def generate(
         self,
         input_ids: Optional[torch.LongTensor] = None,

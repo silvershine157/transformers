@@ -44,9 +44,37 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
+import torch.nn as nn
+import torch
+device = torch.device("cuda")
+
+class SimpleDiscriminator(nn.Module):
+
+    def __init__(self):
+        super(SimpleDiscriminator, self).__init__()
+        self.emb = nn.Embedding(250027, 10)
+
+    def forward(self, ids=None, logits=None, state=None):
+        """
+        ids: [beam, 1]
+        logits: [beam, 1, vocsize]
+        ---
+        score: [beam]
+        """
+        if ids is not None:
+            z = self.emb(ids)
+        elif logits is not None:
+            prob = torch.nn.functional.softmax(logits, dim=2)
+            z = torch.einsum('blv,vd->bld', prob, self.emb.weight) 
+        else:
+            raise ValueError("Least one of ids or logits must be provided")
+        # z: # [beam, 1, d_emb]
+        score = torch.mean(z, dim=2).squeeze(1)
+        return score, state
+
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.5.0")
+#check_min_version("4.5.0")
 
 logger = logging.getLogger(__name__)
 
@@ -509,6 +537,10 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
+
+
+    discriminator = SimpleDiscriminator().to(device)
+    model.register_discriminator(discriminator)
 
     # Evaluation
     results = {}
