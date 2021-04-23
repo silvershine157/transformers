@@ -36,6 +36,8 @@ from transformers import (
     HfArgumentParser,
     MBartTokenizer,
     MBartTokenizerFast,
+    MBart50Tokenizer,
+    MBart50TokenizerFast,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
     default_data_collator,
@@ -46,13 +48,19 @@ from transformers.utils import check_min_version
 
 import torch.nn as nn
 import torch
+
 device = torch.device("cuda")
+#device = torch.device("cpu")
 
 class DummyDiscriminator(nn.Module):
 
     def __init__(self):
         super(DummyDiscriminator, self).__init__()
-        self.emb = nn.Embedding(250027, 10)
+        #voc_size = 250027 -> mbart en ro
+        #voc_size = 250054 -> mbart many to many
+        voc_size = 250054
+        print("VOCAB SIZE: ", voc_size)
+        self.emb = nn.Embedding(voc_size, 10)
 
     def forward(self, ids=None, logits=None, state=None):
         """
@@ -76,6 +84,51 @@ class DummyDiscriminator(nn.Module):
             next_state = state
         # z: # [beam, 1, d_emb]
         score = torch.mean(z, dim=2).squeeze(1)
+        return score, next_state
+
+class Type1Discriminator(nn.Module):
+    """
+    LSTM discriminator
+    """
+    def __init__(self):
+        super(Type1Discriminator, self).__init__()
+        self.d_model = 128
+        #voc_size = 250027 -> mbart en ro
+        #voc_size = 250054 -> mbart many to many
+        voc_size = 250054
+        print("VOCAB SIZE: ", voc_size)
+        self.emb = nn.Embedding(voc_size, self.d_model)
+        self.lstm_cell = nn.LSTMCell(input_size=self.d_model, hidden_size=self.d_model, bias=True)
+        self.init_state = nn.Parameter(torch.zeros([1, 2, self.d_model]))
+        self.score_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.ReLU(),
+            nn.Linear(self.d_model, 1)
+        )
+
+    def forward(self, ids=None, logits=None, state=None):
+        """
+        ids: [beam, 1]
+        logits: [beam, 1, vocsize]
+        ---
+        score: [beam]
+        next_state: [beam, ...]
+        """
+        if ids is not None:
+            z = self.emb(ids)
+        elif logits is not None:
+            prob = torch.nn.functional.softmax(logits, dim=2)
+            z = torch.einsum('blv,vd->bld', prob, self.emb.weight) 
+        else:
+            raise ValueError("Least one of ids or logits must be provided")
+        # z: # [beam, 1, d_emb]
+        if state is None:
+            B = z.shape[0]
+            state = self.init_state.expand(B, -1, -1) # [B, 2, d_model]
+        h0, c0 = state[:, 0, :], state[:, 1, :] # [B, d_model] each
+        h1, c1 = self.lstm_cell(z.squeeze(1), (h0, c0))
+        next_state = torch.stack([h1, c1], dim=1)
+        score = self.score_head(h1).squeeze(1)
         return score, next_state
 
 
@@ -225,6 +278,24 @@ class DataTrainingArguments:
     source_prefix: Optional[str] = field(
         default=None, metadata={"help": "A prefix to add before every source text (useful for T5 models)."}
     )
+    adv_pplm: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use AdvPPLM."
+        },
+    )
+    write_to_file: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to write hypo and target."
+        },
+    )
+    predict_split: str = field(
+        default='test',
+        metadata={
+            "help": "Data split used for prediction."
+        },
+    )
 
     def __post_init__(self):
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
@@ -358,11 +429,11 @@ def main():
     )
 
     # Set decoder_start_token_id
-    if model.config.decoder_start_token_id is None and isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast)):
+    if model.config.decoder_start_token_id is None and isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast, MBart50Tokenizer, MBart50TokenizerFast)):
         assert (
             data_args.target_lang is not None and data_args.source_lang is not None
         ), "mBart requires --target_lang and --source_lang"
-        if isinstance(tokenizer, MBartTokenizer):
+        if isinstance(tokenizer, (MBartTokenizer, MBart50Tokenizer)):
             model.config.decoder_start_token_id = tokenizer.lang_code_to_id[data_args.target_lang]
         else:
             model.config.decoder_start_token_id = tokenizer.convert_tokens_to_ids(data_args.target_lang)
@@ -386,7 +457,7 @@ def main():
 
     # For translation we set the codes of our source and target languages (only useful for mBART, the others will
     # ignore those attributes).
-    if isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast)):
+    if isinstance(tokenizer, (MBartTokenizer, MBartTokenizerFast, MBart50Tokenizer, MBart50TokenizerFast)):
         if data_args.source_lang is not None:
             tokenizer.src_lang = data_args.source_lang
         if data_args.target_lang is not None:
@@ -459,7 +530,10 @@ def main():
         max_target_length = data_args.val_max_target_length
         if "test" not in datasets:
             raise ValueError("--do_predict requires a test dataset")
-        test_dataset = datasets["test"]
+        
+        #test_dataset = datasets["test"]
+        test_dataset = datasets[data_args.predict_split]
+
         if data_args.max_test_samples is not None:
             test_dataset = test_dataset.select(range(data_args.max_test_samples))
         test_dataset = test_dataset.map(
@@ -544,8 +618,16 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    discriminator = DummyDiscriminator().to(device)
-    model.register_discriminator(discriminator)
+    if data_args.adv_pplm:
+        print("Using adv pplm")
+        #disc_path = 'data/train1000/type1_disc.pt'
+        disc_path = 'data/ro-en-train1000/type1_disc.pt'
+        print("DISC: ", disc_path)
+        discriminator = Type1Discriminator().to(device)
+        discriminator.load_state_dict(torch.load(disc_path))
+        model.register_discriminator(discriminator)
+    else:
+        print("NOT using adv pplm")
 
     # Evaluation
     results = {}
@@ -578,14 +660,26 @@ def main():
         trainer.save_metrics("test", metrics)
 
         if trainer.is_world_process_zero():
-            if training_args.predict_with_generate:
+            #if training_args.predict_with_generate:
+            if data_args.write_to_file:
+
+                print("writing hypothesis")
                 test_preds = tokenizer.batch_decode(
                     test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
                 )
                 test_preds = [pred.strip() for pred in test_preds]
-                output_test_preds_file = os.path.join(training_args.output_dir, "test_generations.txt")
+                output_test_preds_file = os.path.join(training_args.output_dir, "hypothesis.txt")
                 with open(output_test_preds_file, "w") as writer:
                     writer.write("\n".join(test_preds))
+
+                print("writing targets")
+                test_targets = tokenizer.batch_decode(
+                    test_results.label_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+                )
+                test_targets = [target.strip() for target in test_targets]
+                output_test_target_file = os.path.join(training_args.output_dir, "target.txt")
+                with open(output_test_target_file, "w") as writer:
+                    writer.write("\n".join(test_targets))
 
     return results
 

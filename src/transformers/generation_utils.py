@@ -1733,6 +1733,7 @@ class GenerationMixin:
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                in_generate=True
             )
             next_token_logits = outputs.logits[:, -1, :]
 

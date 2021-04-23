@@ -1298,6 +1298,7 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        in_generate=False
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
@@ -1314,8 +1315,9 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
             if decoder_input_ids is None:
                 decoder_input_ids = shift_tokens_right(labels, self.config.pad_token_id)
 
+        do_pplm = in_generate and self.discriminator is not None
 
-        if self.discriminator is not None:
+        if do_pplm:
 
             # 1. tell the discriminator what token has been chosen last time
             if past_key_values is None:
@@ -1379,7 +1381,7 @@ class MBartForConditionalGeneration(MBartPreTrainedModel):
             )
             lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias # [beam(5), 1, vocsize(250027)]
 
-        if self.discriminator is not None:
+        if do_pplm:
             past = (outputs.past_key_values, current_disc_state)
         else:
             past = outputs.past_key_values

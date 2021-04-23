@@ -504,7 +504,13 @@ class PreTrainedTokenizerFast(PreTrainedTokenizerBase):
 
         if isinstance(token_ids, int):
             token_ids = [token_ids]
-        text = self._tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+        try:
+            text = self._tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
+        except OverflowError:
+            print("token ids")
+            print(token_ids)
+            raise RuntimeError
 
         if clean_up_tokenization_spaces:
             clean_text = self.clean_up_tokenization(text)
