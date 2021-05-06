@@ -44,6 +44,8 @@ from transformers.file_utils import is_offline_mode
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
+import tqdm
+import torch
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.5.0")
@@ -351,17 +353,6 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
-
-    if model.config.decoder_start_token_id is None:
-        raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
 
     prefix = data_args.source_prefix if data_args.source_prefix is not None else ""
 
@@ -426,35 +417,6 @@ def main():
         model_inputs["labels"] = labels["input_ids"]
         return model_inputs
 
-    if training_args.do_train:
-        train_dataset = datasets["train"]
-        if "train" not in datasets:
-            raise ValueError("--do_train requires a train dataset")
-        if data_args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(data_args.max_train_samples))
-        train_dataset = train_dataset.map(
-            preprocess_function,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
-
-    if training_args.do_eval:
-        max_target_length = data_args.val_max_target_length
-        if "validation" not in datasets:
-            raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = datasets["validation"]
-        if data_args.max_val_samples is not None:
-            eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
-        eval_dataset = eval_dataset.map(
-            preprocess_function,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
-
     if training_args.do_predict:
         max_target_length = data_args.val_max_target_length
         if "test" not in datasets:
@@ -463,131 +425,36 @@ def main():
         test_dataset = datasets[data_args.predict_split]
         if data_args.max_test_samples is not None:
             test_dataset = test_dataset.select(range(data_args.max_test_samples))
-        test_dataset = test_dataset.map(
+
+        """
+        proc_test_dataset = test_dataset.map(
             preprocess_function,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
             remove_columns=column_names,
             load_from_cache_file=not data_args.overwrite_cache,
         )
+        """
 
-    # Data collator
-    label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer,
-        model=model,
-        label_pad_token_id=label_pad_token_id,
-        pad_to_multiple_of=8 if training_args.fp16 else None,
-    )
+    triplet_data = []
+    triplet_data_path = os.path.join(training_args.output_dir, "triplet_data.dat")
+    hypo_path = os.path.join(training_args.output_dir, 'test_generations.txt')
 
-    # Metric
-    metric = load_metric("rouge")
+    with open(hypo_path, 'r', encoding='utf-8') as hypo_f:
+        hypo_list = hypo_f.readlines()
 
-    def postprocess_text(preds, labels):
-        preds = [pred.strip() for pred in preds]
-        labels = [label.strip() for label in labels]
+    assert len(hypo_list) == len(test_dataset)
+    
+    for idx, ds_item in tqdm.tqdm(enumerate(test_dataset)):
+        triplet_item = {}
+        triplet_item["id"] = ds_item['id']
+        triplet_item["src"] = ds_item['article']
+        triplet_item["tgt"] = ds_item['highlights']
+        triplet_item["hypo"] = hypo_list[idx]
+        triplet_data.append(triplet_item)
 
-        # rougeLSum expects newline after each sentence
-        preds = ["\n".join(nltk.sent_tokenize(pred)) for pred in preds]
-        labels = ["\n".join(nltk.sent_tokenize(label)) for label in labels]
-
-        return preds, labels
-
-    def compute_metrics(eval_preds):
-        preds, labels = eval_preds
-        if isinstance(preds, tuple):
-            preds = preds[0]
-        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
-        if data_args.ignore_pad_token_for_loss:
-            # Replace -100 in the labels as we can't decode them.
-            labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
-        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-
-        # Some simple post-processing
-        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
-
-        result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
-        # Extract a few results from ROUGE
-        result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
-
-        prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
-        result["gen_len"] = np.mean(prediction_lens)
-        result = {k: round(v, 4) for k, v in result.items()}
-        return result
-
-    # Initialize our Trainer
-    trainer = Seq2SeqTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics if training_args.predict_with_generate else None,
-    )
-
-    # Training
-    if training_args.do_train:
-        if last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        elif os.path.isdir(model_args.model_name_or_path):
-            checkpoint = model_args.model_name_or_path
-        else:
-            checkpoint = None
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()  # Saves the tokenizer too for easy upload
-
-        metrics = train_result.metrics
-        max_train_samples = (
-            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
-        )
-        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
-
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
-
-    # Evaluation
-    results = {}
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
-
-        metrics = trainer.evaluate(
-            max_length=data_args.val_max_target_length, num_beams=data_args.num_beams, metric_key_prefix="eval"
-        )
-        max_val_samples = data_args.max_val_samples if data_args.max_val_samples is not None else len(eval_dataset)
-        metrics["eval_samples"] = min(max_val_samples, len(eval_dataset))
-
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-
-    if training_args.do_predict:
-        logger.info("*** Test ***")
-
-        test_results = trainer.predict(
-            test_dataset,
-            metric_key_prefix="test",
-            max_length=data_args.val_max_target_length,
-            num_beams=data_args.num_beams,
-        )
-        metrics = test_results.metrics
-        max_test_samples = data_args.max_test_samples if data_args.max_test_samples is not None else len(test_dataset)
-        metrics["test_samples"] = min(max_test_samples, len(test_dataset))
-
-        trainer.log_metrics("test", metrics)
-        trainer.save_metrics("test", metrics)
-
-        if trainer.is_world_process_zero():
-            if training_args.predict_with_generate:
-                test_preds = tokenizer.batch_decode(
-                    test_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
-                )
-                test_preds = [pred.strip() for pred in test_preds]
-                output_test_preds_file = os.path.join(training_args.output_dir, "test_generations.txt")
-                with open(output_test_preds_file, "w") as writer:
-                    writer.write("\n".join(test_preds))
-
-    return results
+    torch.save(triplet_data, triplet_data_path)
+    print("saved to " + triplet_data_path)
 
 
 def _mp_fn(index):
