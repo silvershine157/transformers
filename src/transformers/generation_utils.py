@@ -409,7 +409,10 @@ class GenerationMixin:
             encoder_kwargs = {
                 argument: value for argument, value in model_kwargs.items() if not argument.startswith("decoder_")
             }
+            print("LOG: encoder (in prepare)")
             model_kwargs["encoder_outputs"]: ModelOutput = encoder(input_ids, return_dict=True, **encoder_kwargs)
+            if self.do_advpplm:
+                model_kwargs["disc_enc_out"] = self.disc.prepare_incremental(input_ids, return_dict=True, **encoder_kwargs)
         return model_kwargs
 
     def _prepare_decoder_input_ids_for_generation(
@@ -460,6 +463,7 @@ class GenerationMixin:
         is_encoder_decoder: bool = False,
         attention_mask: torch.LongTensor = None,
         encoder_outputs: ModelOutput = None,
+        disc_enc_out: ModelOutput = None,
         **model_kwargs,
     ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
         expanded_return_idx = (
@@ -480,6 +484,12 @@ class GenerationMixin:
                 0, expanded_return_idx.to(encoder_outputs.last_hidden_state.device)
             )
             model_kwargs["encoder_outputs"] = encoder_outputs
+            if disc_enc_out is not None:
+                print("disc enc out EXPAND!")
+                disc_enc_out["last_hidden_state"] = disc_enc_out.last_hidden_state.index_select(
+                    0, expanded_return_idx.to(disc_enc_out.last_hidden_state.device)
+                )
+                model_kwargs["disc_enc_out"] = disc_enc_out
         return input_ids, model_kwargs
 
     @staticmethod

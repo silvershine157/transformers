@@ -44,6 +44,7 @@ from transformers.file_utils import is_offline_mode
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
 
+from train_disc import T5PrefixDiscriminator
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.5.0")
@@ -456,6 +457,13 @@ def main():
             remove_columns=column_names,
             load_from_cache_file=not data_args.overwrite_cache,
         )
+
+    adv_pplm_sampling = True
+    if adv_pplm_sampling:
+        print("Initializing AdvPPLM sampling")
+        t5base = AutoModelForSeq2SeqLM.from_pretrained('t5-small')
+        disc = T5PrefixDiscriminator(base=t5base)
+        model.init_adv_pplm(disc)
 
     if training_args.do_predict:
         max_target_length = data_args.val_max_target_length

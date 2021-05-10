@@ -1,9 +1,13 @@
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+import tqdm
+
+device = torch.device("cuda")
 
 train_path = 'data/t5-train-150k/triplet_data.dat'
 test_path = 'data/t5-test/triplet_data.dat'
-
 TARGET_MAXLEN = 128
 
 
@@ -14,6 +18,7 @@ class T5PrefixDiscriminator(nn.Module):
         self.out_layer = nn.Linear(512, 1)
 
     def forward(self, enc_ids, enc_mask, dec_ids, dec_mask):
+        # for training
         base_out = self.base(
             input_ids=enc_ids,
             attention_mask=enc_mask,
@@ -25,9 +30,13 @@ class T5PrefixDiscriminator(nn.Module):
         scores = self.out_layer(dec_hidden).squeeze(2) # [B, L]
         return scores
 
-from torch.utils.data import Dataset, DataLoader
+    def prepare_incremental(self, input_ids, **kwargs):
+        enc_out = self.base.encoder(input_ids, **kwargs)
+        return enc_out
 
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+    def forward_incremental():
+        pass
+
 
 class ListDataset(Dataset):
     def __init__(self, datalist):
@@ -73,7 +82,6 @@ def apply_disc_naive(model, src_tokout, tgt_tokout, hypo_tokout):
     total_cnt = 2*B
     return total_loss, correct_cnt, total_cnt
 
-device = torch.device("cuda")
 
 
 def train_epoch(model, loader, optimizer, tokenizer, limit_iter=None):
@@ -81,7 +89,7 @@ def train_epoch(model, loader, optimizer, tokenizer, limit_iter=None):
     running_B = 0
     running_loss = 0.0
     running_correct = torch.zeros(TARGET_MAXLEN, dtype=torch.long, device=device)
-    for batch_idx, batch in enumerate(loader):
+    for batch_idx, batch in tqdm.tqdm(enumerate(loader)):
         src_tokout, tgt_tokout, hypo_tokout = process_batch(batch, tokenizer)
         total_loss, correct_cnt, total_cnt = apply_disc_naive(model, src_tokout, tgt_tokout, hypo_tokout)
         optimizer.zero_grad()
@@ -103,7 +111,7 @@ def eval_epoch(model, loader, tokenizer, limit_iter=None):
     running_loss = 0.0
     running_correct = torch.zeros(TARGET_MAXLEN, dtype=torch.long, device=device)
     with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
+        for batch_idx, batch in tqdm.tqdm(enumerate(loader)):
             src_tokout, tgt_tokout, hypo_tokout = process_batch(batch, tokenizer)
             total_loss, correct_cnt, total_cnt = apply_disc_naive(model, src_tokout, tgt_tokout, hypo_tokout)
             running_B += total_cnt
@@ -136,12 +144,14 @@ def main():
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, tokenizer, limit_iter=200)
         print("train loss: ", train_loss)
         print("train acc[-1]: ", train_acc[-1].item())
-        vaild_loss, valid_acc = eval_epoch(model, valid_loader, tokenizer, limit_iter=100)
+        vaild_loss, valid_acc = eval_epoch(model, valid_loader, tokenizer, limit_iter=200)
         print("valid loss: ", vaild_loss,)
         print("valid acc[-1]: ", valid_acc[-1].item())
-        test_loss, test_acc = eval_epoch(model, test_loader, tokenizer, limit_iter=200)
+        test_loss, test_acc = eval_epoch(model, test_loader, tokenizer, limit_iter=500)
         print("test loss: ", test_loss,)
         print("test acc[-1]: ", test_acc[-1].item())
+        print("<test acc>")
+        print(test_acc)
 
 
 if __name__=='__main__':

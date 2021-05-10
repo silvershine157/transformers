@@ -1396,6 +1396,9 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         self.model_parallel = False
         self.device_map = None
 
+        self.disc = None
+        self.do_advpplm = False
+
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
         self.device_map = (
@@ -1440,6 +1443,10 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
     def get_decoder(self):
         return self.decoder
 
+    def init_adv_pplm(self, disc):
+        self.disc = disc
+        self.do_advpplm = True
+
     @add_start_docstrings_to_model_forward(T5_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=Seq2SeqLMOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -1459,6 +1466,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        disc_enc_out=None
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`):
@@ -1484,6 +1492,13 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             >>> input_ids = tokenizer("summarize: studies have shown that owning a dog is good for you ", return_tensors="pt").input_ids  # Batch size 1
             >>> outputs = model.generate(input_ids)
         """
+
+        if input_ids is not None:
+            # not generation
+            do_advpplm = False
+        else:
+            do_advpplm = self.do_advpplm
+
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1531,7 +1546,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
                 decoder_inputs_embeds = decoder_inputs_embeds[:, -1:]
 
         # Set device for model parallelism
-        if self.model_parallel:
+        if self.model_parallel: # NOT USED FOR GENERATION
             torch.cuda.set_device(self.decoder.first_device)
             hidden_states = hidden_states.to(self.decoder.first_device)
             if decoder_input_ids is not None:
@@ -1541,7 +1556,28 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             if decoder_attention_mask is not None:
                 decoder_attention_mask = decoder_attention_mask.to(self.decoder.first_device)
 
+        #print("LOG: decoder, input ids shape :", decoder_input_ids.shape)
+
         # Decode
+
+        """
+        if do_advpplm:
+            # 1. tell the discriminator what token has been chosen last time
+            if past_key_values is None:
+                disc_past = None
+                gen_past = None
+            else:
+                gen_past, disc_past = past_key_values
+
+            with torch.no_grad():
+
+
+
+            # 2. update generator past
+            # 3. obtain final logits for current generator step
+            pass
+        """
+
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
@@ -1572,6 +1608,9 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
 
         lm_logits = self.lm_head(sequence_output)
 
+
+
+
         loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss(ignore_index=-100)
@@ -1595,7 +1634,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past=None, attention_mask=None, use_cache=None, encoder_outputs=None, **kwargs
+        self, input_ids, past=None, attention_mask=None, use_cache=None, encoder_outputs=None, disc_enc_out=None, **kwargs
     ):
 
         # cut decoder_input_ids if past is used
@@ -1608,6 +1647,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             "encoder_outputs": encoder_outputs,
             "attention_mask": attention_mask,
             "use_cache": use_cache,
+            "disc_enc_out": disc_enc_out
         }
 
     def prepare_decoder_input_ids_from_labels(self, labels: torch.Tensor):
